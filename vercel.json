@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "api/*.py", "use": "@vercel/python" },
+    { "src": "public/**", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/api/chat", "dest": "api/chat.py" },
+    { "src": "/api/share", "dest": "api/share.py" },
+    { "src": "/api/tasks", "dest": "api/tasks.py" },
+    { "src": "/(.*)", "dest": "public/index.html" }
+  ]
+}
