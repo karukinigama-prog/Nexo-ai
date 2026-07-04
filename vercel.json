@@ -1,7 +1,9 @@
 {
   "version": 2,
   "builds": [
-    { "src": "api/*.py", "use": "@vercel/python" },
+    { "src": "api/chat.py", "use": "@vercel/python" },
+    { "src": "api/share.py", "use": "@vercel/python" },
+    { "src": "api/tasks.py", "use": "@vercel/python" },
     { "src": "public/**", "use": "@vercel/static" }
   ],
   "routes": [
