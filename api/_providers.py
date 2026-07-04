@@ -239,4 +239,14 @@ def get_provider_stream(model_name, messages, system_prompt, has_image=False,
     elif model_name == "Craft v3":
         return stream_github_models(messages, system_prompt)
     else:
-        return stream_groq(messages, system_prompt)  # fallback to fastest model
+        return stream_groq(messages, system_prompt)
+
+# ═══════════════════════════════════════════════════════════════
+# VERCEL SERVERLESS APPLICATION HANDLER (ADDED TO FIX BUILD ERROR)
+# ═══════════════════════════════════════════════════════════════
+def app(environ, start_response):
+    """A minimal WSGI application instance to satisfy Vercel's build process requirements."""
+    status = '200 OK'
+    response_headers = [('Content-type', 'text/plain; charset=utf-8')]
+    start_response(status, response_headers)
+    return [b"Nexo AI — Shared Providers Module API Endpoint Active."]
