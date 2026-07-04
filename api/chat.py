@@ -7,7 +7,9 @@ import sys
 import os
 import json
 
-sys.path.insert(0, os.path.dirname(__file__))
+# Add project root directory to sys.path to find _providers.py outside /api
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from _providers import (
     build_system_prompt, get_provider_stream, tavily_search,
     format_search_results, sse, GROQ_MODELS, GROQ_ENGINE,
@@ -24,11 +26,7 @@ TASKS = []
 def generate_research_queries(user_question):
     """Derive 3 differently-angled search queries from the user's question (simple heuristic)."""
     base = user_question.strip().rstrip("?")
-    return [
-        base,
-        f"{base} latest news",
-        f"{base} explained analysis",
-    ]
+    return [\n        base,\n        f"{base} latest news",\n        f"{base} explained analysis",\n    ]
 
 
 def maybe_create_task(user_text):
@@ -37,84 +35,79 @@ def maybe_create_task(user_text):
     if lowered.startswith("/task ") or " and notify me" in lowered:
         task_id = f"task_{len(TASKS) + 1}"
         TASKS.append({"id": task_id, "title": user_text[:60], "status": "done"})
-        # NOTE: true async background execution isn't reliable on serverless;
-        # this is a best-effort simulation for Phase 1 — task is marked done immediately
-        # since the actual AI response IS the task result in this simplified version.
-
-
-def needs_search(user_text):
-    """Simple heuristic: does this look like a factual/current-events question?"""
-    triggers = [
-        "today", "latest", "current", "now", "recent", "news", "who is", "what is",
-        "when did", "when is", "score", "price", "weather", "happened", "2024", "2025", "2026",
-        "දැන්", "අද", "නවතම", "වත්මන්",
-    ]
-    lowered = user_text.lower()
-    return any(t in lowered for t in triggers)
+        # NOTE: true async background execution isn't reliable on serverless functions, so tasks are fake-sync.
 
 
 @app.route("/api/chat", methods=["POST"])
-@app.route("/", methods=["POST"])
 def chat():
-    data = request.get_json(force=True)
-    messages = data.get("messages", [])
+    data = request.get_json(force=True) or {}
     model = data.get("model", "Nexio 1.1")
-    thinking = data.get("thinking", "standard")
+    messages = data.get("messages", [])
+    thinking = data.get("thinking", "standard")  # standard or extended
     research = data.get("research", False)
-    image_b64 = data.get("image")
-    image_mime = data.get("image_mime", "image/jpeg")
-    custom_prompt = data.get("custom_prompt")
-    profile_role = data.get("profile_role")
-    has_image = bool(image_b64)
+    custom_prompt = data.get("customPrompt", None)
+    profile_role = data.get("profileRole", None)
 
-    if messages:
-        last_user_msg = messages[-1].get("content", "")
-        maybe_create_task(last_user_msg)
+    # Multi-modal detection (if any message has an attached image)
+    has_image = data.get("hasImage", False)
+    image_b64 = data.get("imageB64", None)
+    image_mime = data.get("imageMime", "image/jpeg")
 
+    if not messages:
+        return {"error": "No messages provided"}, 400
+
+    user_question = messages[-1]["content"] if messages else ""
+    maybe_create_task(user_question)
+
+    # Build the specialized system prompt layer using our shared helper
     system_prompt = build_system_prompt(
         model_name=model,
         thinking=thinking,
         research=research,
         custom_prompt=custom_prompt,
         profile_role=profile_role,
-        has_image=has_image,
+        has_image=has_image
     )
 
     def generate():
         try:
-            # ── DEEP RESEARCH MODE: 3 sequential Tavily searches ──
-            if research and messages:
-                user_question = messages[-1].get("content", "")
+            # ── DEEP RESEARCH MODE ──
+            if research and not has_image:
                 queries = generate_research_queries(user_question)
+                yield sse({"text": "🔍 *Running deep multi-angle research search...*\\n"})
+                
                 all_results = []
-                for i, q in enumerate(queries, start=1):
-                    yield sse({"researching": f"{i}/3"})
-                    results = tavily_search(q, max_results=4)
+                for q in queries:
+                    results = tavily_search(q, max_results=3)
                     all_results.extend(results)
+                
+                if not all_results:
+                    yield sse({"text": "⚠️ *Web search yielded no results. Proceeding with base knowledge...*\\n\\n"})
+                else:
+                    search_context = format_search_results(all_results)
+                    augmented_messages = list(messages)
+                    augmented_messages[-1] = {
+                        "role": "user",
+                        "content": f"{user_question}\\n\\n[Web search results gathered for report synthesis:]\\n{search_context}\\n\\nSynthesize these multi-angle sources fully into your response.",
+                    }
+                    for chunk in get_provider_stream(model, augmented_messages, system_prompt):
+                        yield chunk
+                    return
 
-                search_context = format_search_results(all_results)
-                augmented_messages = list(messages)
-                augmented_messages[-1] = {
-                    "role": "user",
-                    "content": f"{user_question}\n\n[Web search results gathered for research:]\n{search_context}",
-                }
-                for chunk in get_provider_stream(model, augmented_messages, system_prompt,
-                                                   has_image=has_image, image_b64=image_b64,
-                                                   image_mime=image_mime):
-                    yield chunk
-                return
+            # ── AUTO TOOL-CALLING WEB SEARCH (Fallback for standard queries that need current facts) ──
+            # Very primitive intent detection for Phase 1
+            trigger_words = {"today", "weather", "news", "latest", "current", "stock price", "vs", "2024", "2025", "2026"}
+            needs_search = any(w in user_question.lower() for w in trigger_words)
 
-            # ── AUTO WEB SEARCH for factual/current questions (Groq models only, via simple pre-search) ──
-            if not has_image and messages and needs_search(messages[-1].get("content", "")):
-                yield sse({"searching": True})
-                user_question = messages[-1].get("content", "")
-                results = tavily_search(user_question, max_results=5)
+            if needs_search and not research and not has_image:
+                yield sse({"text": "🔍 *Searching the web...*\\n"})
+                results = tavily_search(user_question, max_results=4)
                 if results:
                     search_context = format_search_results(results)
                     augmented_messages = list(messages)
                     augmented_messages[-1] = {
                         "role": "user",
-                        "content": f"{user_question}\n\n[Web search results:]\n{search_context}\n\nUse these results to answer accurately. Mention that this is based on current web search results.",
+                        "content": f"{user_question}\\n\\n[Web search results:]\\n{search_context}\\n\\nUse these results to answer accurately. Mention that this is based on current web search results.",
                     }
                     for chunk in get_provider_stream(model, augmented_messages, system_prompt,
                                                        has_image=has_image, image_b64=image_b64,
@@ -129,8 +122,8 @@ def chat():
                 yield chunk
 
         except Exception as e:
-            yield sse({"text": f"\n\n⚠️ Unexpected error: {str(e)}"})
-            yield "data: [DONE]\n\n"
+            yield sse({"text": f"\\n\\n⚠️ Unexpected error: {str(e)}"})
+            yield "data: [DONE]\\n\\n"
 
     resp = Response(stream_with_context(generate()), mimetype="text/event-stream")
     resp.headers["Cache-Control"] = "no-cache"
